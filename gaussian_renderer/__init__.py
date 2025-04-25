@@ -11,9 +11,14 @@
 
 import torch
 import math
-from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
+
+SKEWED_GAUSSIAN_SPLATTING=True
+if SKEWED_GAUSSIAN_SPLATTING:
+    from diff_skewed_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+else:
+    from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False):
     """
@@ -21,7 +26,6 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     
     Background tensor (bg_color) must be on GPU!
     """
- 
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
     screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
     try:
@@ -54,6 +58,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     means3D = pc.get_xyz
     means2D = screenspace_points
     opacity = pc.get_opacity
+    skews3D=pc.get_skews
+    skew_sensitivity=pc.get_skew_sensitivity
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
@@ -86,29 +92,26 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     else:
         colors_precomp = override_color
 
-    # Rasterize visible Gaussians to image, obtain their radii (on screen). 
+    rasterizer_params = {
+        'means3D': means3D,
+        'means2D': means2D,
+        'shs': shs,
+        'colors_precomp': colors_precomp,
+        'opacities': opacity,
+        'scales': scales, 
+        'rotations': rotations,
+        'cov3D_precomp': cov3D_precomp
+    }
+
     if separate_sh:
-        rendered_image, radii, depth_image = rasterizer(
-            means3D = means3D,
-            means2D = means2D,
-            dc = dc,
-            shs = shs,
-            colors_precomp = colors_precomp,
-            opacities = opacity,
-            scales = scales,
-            rotations = rotations,
-            cov3D_precomp = cov3D_precomp)
-    else:
-        rendered_image, radii, depth_image = rasterizer(
-            means3D = means3D,
-            means2D = means2D,
-            shs = shs,
-            colors_precomp = colors_precomp,
-            opacities = opacity,
-            scales = scales,
-            rotations = rotations,
-            cov3D_precomp = cov3D_precomp)
-        
+        rasterizer_params['dc'] = dc
+
+    if SKEWED_GAUSSIAN_SPLATTING:
+        rasterizer_params['skews'] = skews3D
+        rasterizer_params['skew_sensitivity'] = skew_sensitivity
+
+    rendered_image, radii, depth_image = rasterizer(**rasterizer_params)
+
     # Apply exposure to rendered image (training only)
     if use_trained_exp:
         exposure = pc.get_exposure_from_name(viewpoint_camera.image_name)

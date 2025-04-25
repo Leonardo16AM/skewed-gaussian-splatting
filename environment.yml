@@ -1,4 +1,4 @@
-name: gaussian_splatting
+name: skewed-gaussian_splatting
 channels:
   - pytorch
   - conda-forge
@@ -13,7 +13,7 @@ dependencies:
   - torchvision=0.13.1
   - tqdm
   - pip:
-    - submodules/diff-gaussian-rasterization
+    - submodules/diff-skewed-gaussian-rasterization
     - submodules/simple-knn
     - submodules/fused-ssim
     - opencv-python

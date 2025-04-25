@@ -36,6 +36,10 @@ class GaussianModel:
             symm = strip_symmetric(actual_covariance)
             return symm
         
+        self.max_skew = 100.0      
+        self.skew_activation = lambda x: torch.clamp(x, -self.max_skew, self.max_skew)
+        self.skew_sens_activation = lambda x: torch.clamp(x, 100, 1500)
+
         self.scaling_activation = torch.exp
         self.scaling_inverse_activation = torch.log
 
@@ -52,6 +56,8 @@ class GaussianModel:
         self.optimizer_type = optimizer_type
         self.max_sh_degree = sh_degree  
         self._xyz = torch.empty(0)
+        self._skews = torch.empty(0)
+        self._skew_sensitivity = torch.empty(0)
         self._features_dc = torch.empty(0)
         self._features_rest = torch.empty(0)
         self._scaling = torch.empty(0)
@@ -65,10 +71,20 @@ class GaussianModel:
         self.spatial_lr_scale = 0
         self.setup_functions()
 
+    def freeze_skew(self):
+        self._skews.requires_grad = False
+        self._skew_sensitivity.requires_grad = False
+
+    def unfreeze_skew(self):
+        self.skews.requires_grad = True
+        self.skew_sensitivity.requires_grad = True
+
     def capture(self):
         return (
             self.active_sh_degree,
             self._xyz,
+            self._skews,
+            self._skew_sensitivity,
             self._features_dc,
             self._features_rest,
             self._scaling,
@@ -84,6 +100,8 @@ class GaussianModel:
     def restore(self, model_args, training_args):
         (self.active_sh_degree, 
         self._xyz, 
+        self._skews,
+        self._skew_sensitivity,
         self._features_dc, 
         self._features_rest,
         self._scaling, 
@@ -110,6 +128,14 @@ class GaussianModel:
     @property
     def get_xyz(self):
         return self._xyz
+    
+    @property
+    def get_skews(self):
+        return self.skew_activation(self._skews)
+    
+    @property
+    def get_skew_sensitivity(self):
+        return self.skew_sens_activation(self._skew_sensitivity)
     
     @property
     def get_features(self):
@@ -164,6 +190,9 @@ class GaussianModel:
         opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
 
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
+        self._skews = nn.Parameter(torch.zeros_like(self._xyz))
+        self._skew_sensitivity = nn.Parameter(torch.full((fused_point_cloud.shape[0], 1), 1000.0, device="cuda")) 
+
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
         self._scaling = nn.Parameter(scales.requires_grad_(True))
@@ -186,7 +215,9 @@ class GaussianModel:
             {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
-            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
+            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
+            {'params': [self._skews], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "skews"},
+            {'params': [self._skew_sensitivity], 'lr': training_args.scaling_lr, "name": "skew_sensitivity"}
         ]
 
         if self.optimizer_type == "default":
@@ -204,7 +235,14 @@ class GaussianModel:
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=training_args.position_lr_max_steps)
-        
+
+        self.skews_scheduler_args = self.xyz_scheduler_args
+        self.skew_sens_scheduler_args = get_expon_lr_func(
+                                                    lr_init         =training_args.scaling_lr,          
+                                                    lr_final        =training_args.scaling_lr * 0.1,        
+                                                    lr_delay_mult   = 1.0,
+                                                    max_steps       = training_args.position_lr_max_steps)
+
         self.exposure_scheduler_args = get_expon_lr_func(training_args.exposure_lr_init, training_args.exposure_lr_final,
                                                         lr_delay_steps=training_args.exposure_lr_delay_steps,
                                                         lr_delay_mult=training_args.exposure_lr_delay_mult,
@@ -220,7 +258,11 @@ class GaussianModel:
             if param_group["name"] == "xyz":
                 lr = self.xyz_scheduler_args(iteration)
                 param_group['lr'] = lr
-                return lr
+            elif param_group["name"] == "skews":
+                param_group['lr'] = self.skews_scheduler_args(iteration)    
+            elif param_group["name"] == "skew_sensitivity":             
+                param_group["lr"] = self.skew_sens_scheduler_args(iteration)
+        return lr
 
     def construct_list_of_attributes(self):
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
@@ -234,6 +276,9 @@ class GaussianModel:
             l.append('scale_{}'.format(i))
         for i in range(self._rotation.shape[1]):
             l.append('rot_{}'.format(i))
+        for i in range(self._skews.shape[1]):
+            l.append('skew_{}'.format(i))
+        l.append('skew_sensitivity')        
         return l
 
     def save_ply(self, path):
@@ -246,11 +291,13 @@ class GaussianModel:
         opacities = self._opacity.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
+        skews = self._skews.detach().cpu().numpy()
+        skew_sensitivity = self._skew_sensitivity.detach().cpu().numpy()
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation, skews, skew_sensitivity), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -304,12 +351,20 @@ class GaussianModel:
         for idx, attr_name in enumerate(rot_names):
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
 
+        skew_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("skew_") and p.name != "skew_sensitivity"]
+        skew_names = sorted(skew_names, key = lambda x: int(x.split('_')[-1]))
+        skews = np.zeros((xyz.shape[0], len(skew_names)))
+        for idx, attr_name in enumerate(skew_names):
+            skews[:, idx] = np.asarray(plydata.elements[0][attr_name])
+        skew_sensitivity = np.asarray(plydata.elements[0]["skew_sensitivity"])[..., np.newaxis]
+
         self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
         self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._skews = nn.Parameter(torch.tensor(skews, dtype=torch.float, device="cuda").requires_grad_(True))
 
         self.active_sh_degree = self.max_sh_degree
 
@@ -356,6 +411,8 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        self._skews = optimizable_tensors["skews"] 
+        self._skew_sensitivity = optimizable_tensors["skew_sensitivity"]  
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
 
@@ -385,13 +442,15 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_skews, new_skew_sensitivity, new_tmp_radii):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
         "opacity": new_opacities,
         "scaling" : new_scaling,
-        "rotation" : new_rotation}
+        "rotation" : new_rotation,
+        "skews": new_skews,
+        "skew_sensitivity": new_skew_sensitivity}
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
@@ -400,6 +459,8 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        self._skews = optimizable_tensors["skews"]
+        self._skew_sensitivity = optimizable_tensors["skew_sensitivity"]
 
         self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -425,10 +486,11 @@ class GaussianModel:
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
+        new_skews = self._skews[selected_pts_mask].repeat(N,1)
+        new_skew_sensitivity = self._skew_sensitivity[selected_pts_mask].repeat(N,1)
         new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii)
-
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_skews, new_skew_sensitivity, new_tmp_radii)
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
 
@@ -444,11 +506,11 @@ class GaussianModel:
         new_opacities = self._opacity[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
-
+        new_skews = self._skews[selected_pts_mask]
+        new_skew_sensitivity = self._skew_sensitivity[selected_pts_mask]
         new_tmp_radii = self.tmp_radii[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
-
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_skews, new_skew_sensitivity, new_tmp_radii)
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0

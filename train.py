@@ -39,6 +39,121 @@ try:
     SPARSE_ADAM_AVAILABLE = True
 except:
     SPARSE_ADAM_AVAILABLE = False
+def diagnose_gaussians(gaussians, iteration, grad_check=True):
+    """
+    Diagnose Gaussian model parameters to detect potential issues like NaN, Inf values.
+    
+    Args:
+        gaussians: The Gaussian model
+        iteration: Current training iteration (for logging)
+        grad_check: Whether to check gradients as well
+    """
+    param_names = ['_xyz', '_features_dc', '_features_rest', '_opacity', '_scaling', '_rotation', '_skews', '_skew_sensitivity']
+    
+    print(f"\n===== Diagnostic at iteration {iteration} =====")
+    
+    total_params = 0
+    has_problem = False
+    
+    for name in param_names:
+        if not hasattr(gaussians, name):
+            continue
+            
+        param = getattr(gaussians, name)
+        if param is None:
+            continue
+            
+        total_params += param.numel()
+        
+        # Check parameter values
+        has_nan = torch.isnan(param).any().item()
+        has_inf = torch.isinf(param).any().item()
+        
+        if param.numel() > 0:
+            min_val = param.min().item()
+            max_val = param.max().item()
+            mean_val = param.mean().item()
+        else:
+            min_val = max_val = mean_val = 0
+        
+        print(f"{name}: shape={param.shape}, min={min_val:.4f}, max={max_val:.4f}, mean={mean_val:.4f}, NaN={has_nan}, Inf={has_inf}")
+        
+        if has_nan or has_inf:
+            has_problem = True
+            if has_nan:
+                nan_count = torch.isnan(param).sum().item()
+                print(f"  ⚠️ WARNING: {nan_count} NaN values in {name}")
+            if has_inf:
+                inf_count = torch.isinf(param).sum().item()
+                print(f"  ⚠️ WARNING: {inf_count} Inf values in {name}")
+        
+        # Check gradients if requested and available
+        if grad_check and param.grad is not None:
+            grad = param.grad
+            grad_has_nan = torch.isnan(grad).any().item()
+            grad_has_inf = torch.isinf(grad).any().item()
+            
+            if grad.numel() > 0:
+                grad_min_val = grad.min().item()
+                grad_max_val = grad.max().item()
+                grad_mean_val = grad.mean().item()
+                grad_norm = grad.norm().item()
+            else:
+                grad_min_val = grad_max_val = grad_mean_val = grad_norm = 0
+            
+            print(f"{name}.grad: min={grad_min_val:.4f}, max={grad_max_val:.4f}, mean={grad_mean_val:.4f}, norm={grad_norm:.4f}, NaN={grad_has_nan}, Inf={grad_has_inf}")
+            
+            if grad_has_nan or grad_has_inf:
+                has_problem = True
+                if grad_has_nan:
+                    grad_nan_count = torch.isnan(grad).sum().item()
+                    print(f"  ⚠️ WARNING: {grad_nan_count} NaN values in {name}.grad")
+                if grad_has_inf:
+                    grad_inf_count = torch.isinf(grad).sum().item()
+                    print(f"  ⚠️ WARNING: {grad_inf_count} Inf values in {name}.grad")
+    
+    # Check specific state variables that might be relevant
+    state_vars = ['max_radii2D', 'xyz_gradient_accum', 'denom']
+    for name in state_vars:
+        if hasattr(gaussians, name):
+            var = getattr(gaussians, name)
+            if var is not None and isinstance(var, torch.Tensor):
+                has_nan = torch.isnan(var).any().item()
+                has_inf = torch.isinf(var).any().item()
+                
+                if var.numel() > 0:
+                    min_val = var.min().item()
+                    max_val = var.max().item()
+                    mean_val = var.mean().item()
+                else:
+                    min_val = max_val = mean_val = 0
+                
+                print(f"{name}: shape={var.shape}, min={min_val:.4f}, max={max_val:.4f}, mean={mean_val:.4f}, NaN={has_nan}, Inf={has_inf}")
+                
+                if has_nan or has_inf:
+                    has_problem = True
+                    count = (torch.isnan(var) | torch.isinf(var)).sum().item()
+                    print(f"  ⚠️ WARNING: {count} problematic values in {name}")
+    
+    if hasattr(gaussians, 'get_scaling'):
+        scaling = gaussians.get_scaling
+        if scaling.numel() > 0:
+            print(f"Scaling (activated): min={scaling.min().item():.4f}, max={scaling.max().item():.4f}, mean={scaling.mean().item():.4f}")
+    
+    if hasattr(gaussians, 'get_opacity'):
+        opacity = gaussians.get_opacity
+        if opacity.numel() > 0:
+            print(f"Opacity (activated): min={opacity.min().item():.4f}, max={opacity.max().item():.4f}, mean={opacity.mean().item():.4f}")
+    
+    print(f"Total parameters: {total_params}")
+    
+    if has_problem:
+        print("⚠️ POTENTIAL ISSUES DETECTED! See warnings above.")
+    else:
+        print("✓ No obvious issues detected in parameter values.")
+    
+    print("=====================================\n")
+    return has_problem
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
 
@@ -71,6 +186,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):
+        print("ITERATION: ",iteration)
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
@@ -107,7 +223,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             pipe.debug = True
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
-
+        #gaussians.freeze_skew()
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
@@ -138,8 +254,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             Ll1depth = Ll1depth.item()
         else:
             Ll1depth = 0
+        if iteration % 5 == 0:
+            print("Diagnostic before backward pass:")
+            diagnose_gaussians(gaussians, iteration, grad_check=False)
 
         loss.backward()
+        
+        try:
+            # Add diagnostics after backward
+            if iteration % 10 == 0:
+                print("Diagnostic after backward pass:")
+                diagnose_gaussians(gaussians, iteration, grad_check=True)
+        except Exception as e:
+            print(f"Error during diagnostic after backward: {e}")
 
         iter_end.record()
 
@@ -167,8 +294,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                    print("Diagnostic before densification:")
+                    diagnose_gaussians(gaussians, iteration, grad_check=False)
+                    
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+
+                    print("Diagnostic after densification:")
+                    diagnose_gaussians(gaussians, iteration, grad_check=False)
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
@@ -184,7 +317,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 else:
                     gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)
-
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
