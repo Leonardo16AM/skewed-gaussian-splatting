@@ -14,11 +14,6 @@ import math
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
-SKEWED_GAUSSIAN_SPLATTING=True
-if SKEWED_GAUSSIAN_SPLATTING:
-    from diff_skewed_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
-else:
-    from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False):
     """
@@ -32,6 +27,11 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         screenspace_points.retain_grad()
     except:
         pass
+
+    if not pipe.non_skewed:
+        from diff_skewed_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+    else:
+        from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 
     # Set up rasterization configuration
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
@@ -106,7 +106,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     if separate_sh:
         rasterizer_params['dc'] = dc
 
-    if SKEWED_GAUSSIAN_SPLATTING:
+    if not pipe.non_skewed:
         rasterizer_params['skews'] = skews3D
         rasterizer_params['skew_sensitivity'] = skew_sensitivity
 

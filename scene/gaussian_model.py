@@ -36,9 +36,8 @@ class GaussianModel:
             symm = strip_symmetric(actual_covariance)
             return symm
         
-        self.max_skew = 100.0      
-        self.skew_activation = lambda x: torch.clamp(x, -self.max_skew, self.max_skew)
-        self.skew_sens_activation = lambda x: torch.clamp(x, 100, 1500)
+        self.skew_activation = lambda x: 10*torch.tanh(x) # rango ≈[-0.1,0.1]
+        self.skew_sens_activation = lambda x: 1.0 + 19.0 * torch.sigmoid(x)
 
         self.scaling_activation = torch.exp
         self.scaling_inverse_activation = torch.log
@@ -191,7 +190,8 @@ class GaussianModel:
 
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._skews = nn.Parameter(torch.zeros_like(self._xyz))
-        self._skew_sensitivity = nn.Parameter(torch.full((fused_point_cloud.shape[0], 1), 1000.0, device="cuda")) 
+        self._skews.data.normal_(0, 1e-3)
+        self._skew_sensitivity = nn.Parameter(torch.full((fused_point_cloud.shape[0], 1), 10.0, device="cuda")) 
 
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
@@ -216,8 +216,8 @@ class GaussianModel:
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
-            {'params': [self._skews], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "skews"},
-            {'params': [self._skew_sensitivity], 'lr': training_args.scaling_lr, "name": "skew_sensitivity"}
+            {'params':[self._skews], 'lr':training_args.position_lr_init*self.spatial_lr_scale, 'name':'skews'},
+            {'params':[self._skew_sensitivity], 'lr':training_args.scaling_lr, 'name':'skew_sensitivity'}
         ]
 
         if self.optimizer_type == "default":

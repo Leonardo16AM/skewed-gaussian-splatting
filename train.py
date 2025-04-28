@@ -39,22 +39,47 @@ try:
     SPARSE_ADAM_AVAILABLE = True
 except:
     SPARSE_ADAM_AVAILABLE = False
-def diagnose_gaussians(gaussians, iteration, grad_check=True):
+
+def diagnose_gaussians(gaussians, iteration, tb_writer=None, grad_check=True):
     """
     Diagnose Gaussian model parameters to detect potential issues like NaN, Inf values.
+    Only logs tables to TensorBoard without printing anything.
     
     Args:
         gaussians: The Gaussian model
         iteration: Current training iteration (for logging)
+        tb_writer: TensorBoard writer for logging diagnostics as tables
         grad_check: Whether to check gradients as well
     """
+    if tb_writer is None:
+        return False
+    
     param_names = ['_xyz', '_features_dc', '_features_rest', '_opacity', '_scaling', '_rotation', '_skews', '_skew_sensitivity']
     
-    print(f"\n===== Diagnostic at iteration {iteration} =====")
-    
-    total_params = 0
     has_problem = False
     
+    # Prepare data for TensorBoard
+    tb_data = {
+        "Parameter": [],
+        "Shape": [],
+        "Min": [],
+        "Max": [],
+        "Mean": [],
+        "Has_NaN": [],
+        "Has_Inf": []
+    }
+    
+    if grad_check:
+        tb_grad_data = {
+            "Parameter": [],
+            "Min": [],
+            "Max": [],
+            "Mean": [],
+            "Norm": [],
+            "Has_NaN": [],
+            "Has_Inf": []
+        }
+
     for name in param_names:
         if not hasattr(gaussians, name):
             continue
@@ -63,8 +88,6 @@ def diagnose_gaussians(gaussians, iteration, grad_check=True):
         if param is None:
             continue
             
-        total_params += param.numel()
-        
         # Check parameter values
         has_nan = torch.isnan(param).any().item()
         has_inf = torch.isinf(param).any().item()
@@ -76,16 +99,17 @@ def diagnose_gaussians(gaussians, iteration, grad_check=True):
         else:
             min_val = max_val = mean_val = 0
         
-        print(f"{name}: shape={param.shape}, min={min_val:.4f}, max={max_val:.4f}, mean={mean_val:.4f}, NaN={has_nan}, Inf={has_inf}")
+        # Add to TensorBoard data
+        tb_data["Parameter"].append(name)
+        tb_data["Shape"].append(str(param.shape))
+        tb_data["Min"].append(f"{min_val:.4f}")
+        tb_data["Max"].append(f"{max_val:.4f}")
+        tb_data["Mean"].append(f"{mean_val:.4f}")
+        tb_data["Has_NaN"].append(str(has_nan))
+        tb_data["Has_Inf"].append(str(has_inf))
         
         if has_nan or has_inf:
             has_problem = True
-            if has_nan:
-                nan_count = torch.isnan(param).sum().item()
-                print(f"  ⚠️ WARNING: {nan_count} NaN values in {name}")
-            if has_inf:
-                inf_count = torch.isinf(param).sum().item()
-                print(f"  ⚠️ WARNING: {inf_count} Inf values in {name}")
         
         # Check gradients if requested and available
         if grad_check and param.grad is not None:
@@ -101,16 +125,17 @@ def diagnose_gaussians(gaussians, iteration, grad_check=True):
             else:
                 grad_min_val = grad_max_val = grad_mean_val = grad_norm = 0
             
-            print(f"{name}.grad: min={grad_min_val:.4f}, max={grad_max_val:.4f}, mean={grad_mean_val:.4f}, norm={grad_norm:.4f}, NaN={grad_has_nan}, Inf={grad_has_inf}")
+            # Add to TensorBoard gradient data
+            tb_grad_data["Parameter"].append(f"{name}.grad")
+            tb_grad_data["Min"].append(f"{grad_min_val:.4f}")
+            tb_grad_data["Max"].append(f"{grad_max_val:.4f}")
+            tb_grad_data["Mean"].append(f"{grad_mean_val:.4f}")
+            tb_grad_data["Norm"].append(f"{grad_norm:.4f}")
+            tb_grad_data["Has_NaN"].append(str(grad_has_nan))
+            tb_grad_data["Has_Inf"].append(str(grad_has_inf))
             
             if grad_has_nan or grad_has_inf:
                 has_problem = True
-                if grad_has_nan:
-                    grad_nan_count = torch.isnan(grad).sum().item()
-                    print(f"  ⚠️ WARNING: {grad_nan_count} NaN values in {name}.grad")
-                if grad_has_inf:
-                    grad_inf_count = torch.isinf(grad).sum().item()
-                    print(f"  ⚠️ WARNING: {grad_inf_count} Inf values in {name}.grad")
     
     # Check specific state variables that might be relevant
     state_vars = ['max_radii2D', 'xyz_gradient_accum', 'denom']
@@ -128,31 +153,52 @@ def diagnose_gaussians(gaussians, iteration, grad_check=True):
                 else:
                     min_val = max_val = mean_val = 0
                 
-                print(f"{name}: shape={var.shape}, min={min_val:.4f}, max={max_val:.4f}, mean={mean_val:.4f}, NaN={has_nan}, Inf={has_inf}")
+                # Add to TensorBoard data
+                tb_data["Parameter"].append(name)
+                tb_data["Shape"].append(str(var.shape))
+                tb_data["Min"].append(f"{min_val:.4f}")
+                tb_data["Max"].append(f"{max_val:.4f}")
+                tb_data["Mean"].append(f"{mean_val:.4f}")
+                tb_data["Has_NaN"].append(str(has_nan))
+                tb_data["Has_Inf"].append(str(has_inf))
                 
                 if has_nan or has_inf:
                     has_problem = True
-                    count = (torch.isnan(var) | torch.isinf(var)).sum().item()
-                    print(f"  ⚠️ WARNING: {count} problematic values in {name}")
     
+    # Add special attributes to TensorBoard data
     if hasattr(gaussians, 'get_scaling'):
         scaling = gaussians.get_scaling
         if scaling.numel() > 0:
-            print(f"Scaling (activated): min={scaling.min().item():.4f}, max={scaling.max().item():.4f}, mean={scaling.mean().item():.4f}")
+            tb_data["Parameter"].append("Scaling (activated)")
+            tb_data["Shape"].append(str(scaling.shape))
+            tb_data["Min"].append(f"{scaling.min().item():.4f}")
+            tb_data["Max"].append(f"{scaling.max().item():.4f}")
+            tb_data["Mean"].append(f"{scaling.mean().item():.4f}")
+            tb_data["Has_NaN"].append(str(torch.isnan(scaling).any().item()))
+            tb_data["Has_Inf"].append(str(torch.isinf(scaling).any().item()))
     
     if hasattr(gaussians, 'get_opacity'):
         opacity = gaussians.get_opacity
         if opacity.numel() > 0:
-            print(f"Opacity (activated): min={opacity.min().item():.4f}, max={opacity.max().item():.4f}, mean={opacity.mean().item():.4f}")
+            tb_data["Parameter"].append("Opacity (activated)")
+            tb_data["Shape"].append(str(opacity.shape))
+            tb_data["Min"].append(f"{opacity.min().item():.4f}")
+            tb_data["Max"].append(f"{opacity.max().item():.4f}")
+            tb_data["Mean"].append(f"{opacity.mean().item():.4f}")
+            tb_data["Has_NaN"].append(str(torch.isnan(opacity).any().item()))
+            tb_data["Has_Inf"].append(str(torch.isinf(opacity).any().item()))
     
-    print(f"Total parameters: {total_params}")
+    # Log only tables to TensorBoard
+    import pandas as pd
     
-    if has_problem:
-        print("⚠️ POTENTIAL ISSUES DETECTED! See warnings above.")
-    else:
-        print("✓ No obvious issues detected in parameter values.")
+    # Convert dict to DataFrame for better visualization
+    params_df = pd.DataFrame(tb_data)
+    tb_writer.add_text("diagnostics/parameters", params_df.to_markdown(), global_step=iteration)
     
-    print("=====================================\n")
+    if grad_check:
+        grads_df = pd.DataFrame(tb_grad_data)
+        tb_writer.add_text("diagnostics/gradients", grads_df.to_markdown(), global_step=iteration)
+    
     return has_problem
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
@@ -183,10 +229,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
 
+    visualization_interval = 25 
+    visualization_folder = os.path.join(dataset.model_path, "progress_visualizations")
+    os.makedirs(visualization_folder, exist_ok=True)
+    
+    all_cameras = scene.getTrainCameras()
+    fixed_vis_camera = all_cameras[0] if len(all_cameras) > 0 else None
+    if fixed_vis_camera:
+        print(f"Using camera '{fixed_vis_camera.image_name}' for visualization")
+
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):
-        print("ITERATION: ",iteration)
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
@@ -254,19 +308,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             Ll1depth = Ll1depth.item()
         else:
             Ll1depth = 0
-        if iteration % 5 == 0:
-            print("Diagnostic before backward pass:")
-            diagnose_gaussians(gaussians, iteration, grad_check=False)
 
         loss.backward()
-        
-        try:
-            # Add diagnostics after backward
-            if iteration % 10 == 0:
-                print("Diagnostic after backward pass:")
-                diagnose_gaussians(gaussians, iteration, grad_check=True)
-        except Exception as e:
-            print(f"Error during diagnostic after backward: {e}")
 
         iter_end.record()
 
@@ -283,25 +326,48 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # Log and save
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
+            
+            if (iteration<10 or iteration % visualization_interval == 0) and fixed_vis_camera:
+                with torch.no_grad():
+                    rendered_image = render(fixed_vis_camera, gaussians, pipe, background, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)["render"]
+                    
+                rendered_np = (torch.clamp(rendered_image, 0.0, 1.0) * 255).byte().permute(1, 2, 0).cpu().numpy()
+                gt_np = (torch.clamp(fixed_vis_camera.original_image.cuda(), 0.0, 1.0) * 255).byte().permute(1, 2, 0).cpu().numpy()
+                
+                import cv2
+                import numpy as np
+                h, w = rendered_np.shape[:2]
+                comparison = np.zeros((h, w*2, 3), dtype=np.uint8)
+                comparison[:, :w] = rendered_np
+                comparison[:, w:] = gt_np
+                
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                cv2.putText(comparison, 'Generated', (10, 30), font, 1, (255, 255, 255), 2, cv2.LINE_AA)
+                cv2.putText(comparison, 'Original', (w+10, 30), font, 1, (255, 255, 255), 2, cv2.LINE_AA)
+                
+                cv2.putText(comparison, f'Iter: {iteration}', (10, h-20), font, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+                
+                cv2.imwrite(os.path.join(visualization_folder, f"comparison_iter_{iteration:06d}.png"), cv2.cvtColor(comparison, cv2.COLOR_RGB2BGR))
+                
+                if tb_writer:
+                    tb_writer.add_image("progress/fixed_camera_comparison", torch.from_numpy(comparison).permute(2, 0, 1), global_step=iteration)
+                    
+                    diagnose_gaussians(gaussians, iteration, tb_writer=tb_writer, grad_check=True)
+            
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
             # Densification
-            if iteration < opt.densify_until_iter:
+            if iteration < opt.densify_until_iter and False:
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    print("Diagnostic before densification:")
-                    diagnose_gaussians(gaussians, iteration, grad_check=False)
                     
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
-
-                    print("Diagnostic after densification:")
-                    diagnose_gaussians(gaussians, iteration, grad_check=False)
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
