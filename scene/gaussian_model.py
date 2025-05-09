@@ -75,8 +75,8 @@ class GaussianModel:
         self._skew_sensitivity.requires_grad = False
 
     def unfreeze_skew(self):
-        self.skews.requires_grad = True
-        self.skew_sensitivity.requires_grad = True
+        self._skews.requires_grad = True
+        self._skew_sensitivity.requires_grad = True
 
     def capture(self):
         return (

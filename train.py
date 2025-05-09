@@ -277,7 +277,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             pipe.debug = True
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
-        #gaussians.freeze_skew()
+        
+        if iteration < 2000:  
+            if gaussians._skews.requires_grad:    
+                gaussians.freeze_skew()
+        else:                
+            if not gaussians._skews.requires_grad:
+                gaussians.unfreeze_skew()
+                
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
@@ -353,7 +360,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     tb_writer.add_image("progress/fixed_camera_comparison", torch.from_numpy(comparison).permute(2, 0, 1), global_step=iteration)
                     
                     diagnose_gaussians(gaussians, iteration, tb_writer=tb_writer, grad_check=True)
-            
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
