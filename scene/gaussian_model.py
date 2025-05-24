@@ -36,8 +36,8 @@ class GaussianModel:
             symm = strip_symmetric(actual_covariance)
             return symm
         
-        self.skew_activation = lambda x: 10*torch.tanh(x) # rango ≈[-0.1,0.1]
-        self.skew_sens_activation = lambda x: 1.0 + 19.0 * torch.sigmoid(x)
+        self.skew_activation       = lambda x: 0.25 * torch.tanh(x) 
+        self.skew_sens_activation  = lambda x: 0.5 + 19.5 * torch.sigmoid(x)
 
         self.scaling_activation = torch.exp
         self.scaling_inverse_activation = torch.log
@@ -216,8 +216,8 @@ class GaussianModel:
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
-            {'params':[self._skews], 'lr':training_args.position_lr_init*self.spatial_lr_scale, 'name':'skews'},
-            {'params':[self._skew_sensitivity], 'lr':training_args.scaling_lr, 'name':'skew_sensitivity'}
+            {'params':[self._skews], 'lr':training_args.position_lr_init*4, 'name':'skews'},
+            {'params':[self._skew_sensitivity], 'lr':training_args.scaling_lr*10, 'name':'skew_sensitivity'}
         ]
 
         if self.optimizer_type == "default":
@@ -509,8 +509,8 @@ class GaussianModel:
         new_skews = self._skews[selected_pts_mask]
         new_skew_sensitivity = self._skew_sensitivity[selected_pts_mask]
         new_tmp_radii = self.tmp_radii[selected_pts_mask]
-
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_skews, new_skew_sensitivity, new_tmp_radii)
+    
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
